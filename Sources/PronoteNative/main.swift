@@ -1,0 +1,1 @@
+PronoteNativeApp.main()
