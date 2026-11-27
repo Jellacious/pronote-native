@@ -84,6 +84,12 @@ enum QRCodeScanner {
         guard let data = trimmed.data(using: .utf8) else {
             throw QRScannerError.invalidQRPayload
         }
-        return try JSONDecoder().decode(QRCodePayload.self, from: data)
+        let payload = try JSONDecoder().decode(QRCodePayload.self, from: data)
+        guard SafeURL.validatedPronoteServerURL(payload.url) != nil,
+              !payload.login.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !payload.jeton.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw QRScannerError.invalidQRPayload
+        }
+        return payload
     }
 }

@@ -1,4 +1,5 @@
 import { defaultFetcher } from "@literate.ink/utilities";
+import { decode } from "html-entities";
 import {
   AccountKind,
   GradeKind,
@@ -30,7 +31,7 @@ import readline from "node:readline";
 // PRONOTE 2026.2.8 émet `Start({...});} catch`, ce point-virgule fait échouer le parseur de Pawnote.
 const patchedFetcher = async (options) => {
   const res = await defaultFetcher(options);
-  if (typeof res.content === "string" && res.content.includes("Start")) {
+  if (typeof res.content === "string" && res.content.includes("Start") && res.content.includes("catch")) {
     res.content = res.content.replace(/\);\s*\}\s*catch/g, ")}catch");
   }
   return res;
@@ -80,18 +81,14 @@ function buildCredentials(session, refresh, deviceUUID) {
 
 function stripHtml(raw) {
   if (!raw) return "";
-  return String(raw)
+  const text = String(raw)
     .replace(/<br\s*\/?>/gi, "\n")
     .replace(/<\/p>/gi, "\n")
     .replace(/<\/li>/gi, "\n")
     .replace(/<li[^>]*>/gi, "• ")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
+    .replace(/<[^>]+>/g, "");
+  return decode(text)
+    .replace(/\u00A0/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
@@ -670,8 +667,19 @@ rl.on("line", async (line) => {
     const response = await handleRequest(input);
     process.stdout.write(JSON.stringify(response) + "\n");
   } catch (err) {
-    const message = err?.message || String(err);
-    process.stdout.write(JSON.stringify({ ok: false, error: message }) + "\n");
+    const raw = err?.message || String(err);
+    const lower = raw.toLowerCase();
+    const isNetworkErr =
+      lower.includes("enotfound") ||
+      lower.includes("econnrefused") ||
+      lower.includes("etimedout") ||
+      lower.includes("eai_again") ||
+      lower.includes("fetch failed") ||
+      lower.includes("network");
+    const safeMessage = isNetworkErr
+      ? "Réseau indisponible : impossible de contacter Pronote."
+      : raw.replace(/https?:\/\/[^\s]+/gi, "[URL]");
+    process.stdout.write(JSON.stringify({ ok: false, error: safeMessage }) + "\n");
   }
 });
 

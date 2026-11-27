@@ -6,6 +6,7 @@ struct TimetableView: View {
     @State private var selectedCourse: CourseItem?
     @State private var swipeOffset: CGFloat = 0
     @State private var swipeOpacity: Double = 1.0
+    @State private var isAnimatingWeek: Bool = false
 
     private var hourHeight: CGFloat { settings.hourHeight }
     private let timeColumnWidth: CGFloat = 56
@@ -41,60 +42,64 @@ struct TimetableView: View {
                 errorBanner(error)
             }
 
-            dayHeaderRow
-            Divider()
+            VStack(spacing: 0) {
+                dayHeaderRow
+                Divider()
 
-            ZStack {
-                timetableGrid
-                    .offset(x: swipeOffset)
-                    .opacity(swipeOpacity)
+                ZStack {
+                    timetableGrid
 
-                if abs(swipeOffset) >= 90 {
-                    HStack {
-                        if swipeOffset > 0 {
-                            Image(systemName: "chevron.left.circle.fill")
+                    if abs(swipeOffset) >= 90 {
+                        HStack {
+                            if swipeOffset > 0 {
+                                Image(systemName: "chevron.left.circle.fill")
+                                    .font(.system(size: 32))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.leading, 24)
+                            }
+                            Spacer()
+                            if swipeOffset < 0 {
+                                Image(systemName: "chevron.right.circle.fill")
+                                    .font(.system(size: 32))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.trailing, 24)
+                            }
+                        }
+                        .allowsHitTesting(false)
+                    }
+
+                    if viewModel.isLoading && viewModel.courses.isEmpty {
+                        VStack(spacing: 12) {
+                            ProgressView()
+                                .controlSize(.regular)
+                            Text("Chargement de l'emploi du temps…")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(24)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                    } else if !viewModel.isLoading && viewModel.courses.isEmpty && viewModel.errorMessage == nil {
+                        VStack(spacing: 10) {
+                            Image(systemName: "calendar")
                                 .font(.system(size: 32))
                                 .foregroundStyle(.secondary)
-                                .padding(.leading, 24)
-                        }
-                        Spacer()
-                        if swipeOffset < 0 {
-                            Image(systemName: "chevron.right.circle.fill")
-                                .font(.system(size: 32))
+                            Text("Aucun cours cette semaine")
+                                .font(.headline)
                                 .foregroundStyle(.secondary)
-                                .padding(.trailing, 24)
                         }
+                        .padding(24)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
                     }
-                    .allowsHitTesting(false)
-                }
-
-                if viewModel.isLoading && viewModel.courses.isEmpty {
-                    VStack(spacing: 12) {
-                        ProgressView()
-                            .controlSize(.regular)
-                        Text("Chargement de l'emploi du temps…")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(24)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
-                } else if !viewModel.isLoading && viewModel.courses.isEmpty && viewModel.errorMessage == nil {
-                    VStack(spacing: 10) {
-                        Image(systemName: "calendar")
-                            .font(.system(size: 32))
-                            .foregroundStyle(.secondary)
-                        Text("Aucun cours cette semaine")
-                            .font(.headline)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(24)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
                 }
             }
+            .offset(x: swipeOffset)
+            .opacity(swipeOpacity)
+            .clipped()
         }
         .background(AmbientBackground())
         .frame(minWidth: 920, minHeight: 640)
-        .navigationTitle("")
+        .navigationTitle(monthYearTitle)
+        .navigationSubtitle(timetableSubtitle)
         .onInteractiveTrackpadSwipe(
             dragOffset: $swipeOffset,
             swipeOpacity: $swipeOpacity,
@@ -119,35 +124,12 @@ struct TimetableView: View {
             }
         )
         .toolbar {
-            ToolbarItem(placement: .navigation) {
-                VStack(alignment: .leading, spacing: 1) {
-                    HStack(spacing: 8) {
-                        Text(monthYearTitle)
-                            .font(.title3.bold())
-                            .contentTransition(.numericText())
-                            .animation(.easeInOut(duration: 0.2), value: viewModel.currentWeekStart)
-                        if let label = viewModel.currentWeekLabel, !label.isEmpty {
-                            Text(label)
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 2)
-                                .background(Color.accentColor.opacity(0.16), in: Capsule())
-                                .foregroundStyle(Color.accentColor)
-                        }
-                    }
-                    Text(weekRangeSubtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .contentTransition(.numericText())
-                        .animation(.easeInOut(duration: 0.2), value: viewModel.currentWeekStart)
-                }
-                .padding(.trailing, 8)
-            }
-
             ToolbarItem(placement: .principal) {
                 HStack(spacing: 4) {
                     Button {
-                        Task { await viewModel.goToPreviousWeek() }
+                        animateWeekTransition(direction: -1) {
+                            await viewModel.goToPreviousWeek()
+                        }
                     } label: {
                         Image(systemName: "chevron.left")
                             .frame(width: 18, height: 18)
@@ -162,7 +144,9 @@ struct TimetableView: View {
                     .help("Revenir à aujourd'hui (⌘T)")
 
                     Button {
-                        Task { await viewModel.goToNextWeek() }
+                        animateWeekTransition(direction: 1) {
+                            await viewModel.goToNextWeek()
+                        }
                     } label: {
                         Image(systemName: "chevron.right")
                             .frame(width: 18, height: 18)
@@ -170,12 +154,74 @@ struct TimetableView: View {
                     .keyboardShortcut(.rightArrow, modifiers: [])
                     .help("Semaine suivante (→)")
                 }
-                .disabled(viewModel.isLoading)
+                .disabled(viewModel.isLoading || isAnimatingWeek)
             }
         }
-        .popover(item: $selectedCourse) { course in
-            CourseDetailPopover(course: course)
+    }
+
+    private var timetableSubtitle: String {
+        if let label = viewModel.currentWeekLabel, !label.isEmpty {
+            return "\(weekRangeSubtitle) · \(label)"
         }
+        return weekRangeSubtitle
+    }
+
+    private func animateWeekTransition(direction: Int, action: @escaping @MainActor () async -> Void) {
+        guard !isAnimatingWeek else { return }
+        isAnimatingWeek = true
+        Haptics.play(.generic)
+        let exitX: CGFloat = direction > 0 ? -180 : 180
+        let enterX: CGFloat = direction > 0 ? 70 : -70
+
+        withAnimation(.easeIn(duration: 0.14)) {
+            swipeOffset = exitX
+            swipeOpacity = 0
+        }
+
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 140_000_000)
+            await action()
+            swipeOffset = enterX
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+                swipeOffset = 0
+                swipeOpacity = 1
+            }
+            isAnimatingWeek = false
+        }
+    }
+
+    private func matchingResources(for course: CourseItem) -> [LessonResourceItem] {
+        let cal = Calendar.current
+        return viewModel.resources.filter { res in
+            let sameDay = cal.isDate(res.startDate, inSameDayAs: course.startDate)
+            let sameTime = abs(res.startDate.timeIntervalSince(course.startDate)) < 900
+            let sameSubject = res.subject.caseInsensitiveCompare(course.subject) == .orderedSame
+            return sameDay && (sameTime || sameSubject) && !res.contents.isEmpty
+        }
+    }
+
+    private func matchingAssignments(for course: CourseItem) -> [AssignmentItem] {
+        let cal = Calendar.current
+        return viewModel.assignments.filter { hw in
+            cal.isDate(hw.deadline, inSameDayAs: course.startDate) &&
+            hw.subject.caseInsensitiveCompare(course.subject) == .orderedSame
+        }
+    }
+
+    private func resourcePreviewText(for course: CourseItem) -> String? {
+        let matched = matchingResources(for: course)
+        for res in matched {
+            for content in res.contents {
+                if let title = content.title?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
+                    return title
+                }
+                let desc = content.description.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !desc.isEmpty {
+                    return desc
+                }
+            }
+        }
+        return nil
     }
 
     private func errorBanner(_ error: String) -> some View {
@@ -238,7 +284,6 @@ struct TimetableView: View {
                 .frame(height: 52)
             }
         }
-        .background(.ultraThinMaterial)
     }
 
     private var timetableGrid: some View {
@@ -309,11 +354,32 @@ struct TimetableView: View {
                     let xOffset = colWidth * CGFloat(item.column)
                     let metrics = courseVerticalMetrics(item.course)
 
-                    CourseCardView(course: item.course, blockHeight: metrics.height) {
+                    CourseCardView(
+                        course: item.course,
+                        blockHeight: metrics.height,
+                        resourcePreview: resourcePreviewText(for: item.course)
+                    ) {
                         selectedCourse = item.course
                     }
                     .frame(width: max(0, colWidth - 6), height: metrics.height)
-                    .offset(x: xOffset + 3, y: metrics.topOffset)
+                    .popover(
+                        isPresented: Binding(
+                            get: { selectedCourse?.id == item.course.id },
+                            set: { if !$0 && selectedCourse?.id == item.course.id { selectedCourse = nil } }
+                        ),
+                        arrowEdge: .trailing
+                    ) {
+                        CourseDetailPopover(
+                            course: item.course,
+                            resources: matchingResources(for: item.course),
+                            assignments: matchingAssignments(for: item.course),
+                            onToggleAssignment: { hw in
+                                Task { await viewModel.toggleAssignmentDone(hw) }
+                            }
+                        )
+                    }
+                    .padding(.leading, xOffset + 3)
+                    .padding(.top, metrics.topOffset)
                 }
 
                 if isToday, let timeOffset = currentTimeOffset() {
@@ -460,6 +526,7 @@ struct TimetableView: View {
 private struct CourseCardView: View {
     let course: CourseItem
     let blockHeight: CGFloat
+    let resourcePreview: String?
     let onTap: () -> Void
 
     @State private var isHovered = false
@@ -514,6 +581,21 @@ private struct CourseCardView: View {
                     }
                     .padding(.top, 1)
                 }
+
+                if blockHeight >= 110, let preview = resourcePreview, !preview.isEmpty {
+                    HStack(alignment: .top, spacing: 4) {
+                        Image(systemName: "book.closed")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 1.5)
+                        Text(preview)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(blockHeight >= 150 ? 3 : 2)
+                            .multilineTextAlignment(.leading)
+                    }
+                    .padding(.top, 2)
+                }
             }
             .padding(.leading, 11)
             .padding(.trailing, 8)
@@ -555,6 +637,9 @@ private struct CourseCardView: View {
 
 private struct CourseDetailPopover: View {
     let course: CourseItem
+    let resources: [LessonResourceItem]
+    let assignments: [AssignmentItem]
+    let onToggleAssignment: (AssignmentItem) -> Void
 
     private var accentColor: Color {
         course.isCancelled ? .red : course.displayColor
@@ -621,6 +706,74 @@ private struct CourseDetailPopover: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if !resources.isEmpty {
+                Divider()
+                Label("Contenu du cours", systemImage: "book.closed")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(resources) { res in
+                            ForEach(res.contents) { content in
+                                VStack(alignment: .leading, spacing: 4) {
+                                    if let title = content.title, !title.isEmpty {
+                                        Text(title)
+                                            .font(.subheadline.weight(.semibold))
+                                    }
+                                    if !content.description.isEmpty {
+                                        Text(content.description)
+                                            .font(.caption)
+                                            .foregroundStyle(.primary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                            .textSelection(.enabled)
+                                    }
+                                    if !content.attachments.isEmpty {
+                                        FlowAttachmentRow(attachments: content.attachments)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 220)
+            }
+
+            if !assignments.isEmpty {
+                Divider()
+                Label("Devoirs pour ce cours", systemImage: "checklist")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(assignments) { hw in
+                        HStack(alignment: .top, spacing: 8) {
+                            Button {
+                                onToggleAssignment(hw)
+                            } label: {
+                                Image(systemName: hw.done ? "checkmark.circle.fill" : "circle")
+                                    .font(.subheadline)
+                                    .foregroundStyle(hw.done ? .green : .secondary)
+                            }
+                            .buttonStyle(.plain)
+
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(hw.description.isEmpty ? "Devoir" : hw.description)
+                                    .font(.caption)
+                                    .strikethrough(hw.done)
+                                    .opacity(hw.done ? 0.55 : 1)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .textSelection(.enabled)
+
+                                if !hw.attachments.isEmpty {
+                                    FlowAttachmentRow(attachments: hw.attachments)
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         .padding(16)

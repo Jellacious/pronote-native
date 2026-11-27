@@ -118,8 +118,8 @@ struct GradesView: View {
                                     .font(.headline)
 
                                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 12)], spacing: 12) {
-                                    ForEach(summary.subjectAverages) { avg in
-                                        SubjectAverageCardView(avg: avg)
+                                    ForEach(Array(summary.subjectAverages.enumerated()), id: \.element.id) { index, avg in
+                                        SubjectAverageCardView(avg: avg, index: index)
                                     }
                                 }
                             }
@@ -134,6 +134,7 @@ struct GradesView: View {
                                     Text("Chronologique").tag(false)
                                     Text("Par matière").tag(true)
                                 }
+                                .labelsHidden()
                                 .pickerStyle(.segmented)
                                 .frame(width: 220)
                             }
@@ -172,13 +173,8 @@ struct GradesView: View {
             }
         }
         .background(AmbientBackground())
-        .navigationTitle("")
+        .navigationTitle("Notes")
         .toolbar {
-            ToolbarItem(placement: .navigation) {
-                Text("Notes")
-                    .font(.title3.bold())
-            }
-
             ToolbarItem(placement: .principal) {
                 if let periods = viewModel.grades?.periods, !periods.isEmpty {
                     Picker("Période", selection: Binding(
@@ -257,6 +253,7 @@ struct GradesView: View {
 
 private struct SubjectAverageCardView: View {
     let avg: SubjectAverageItem
+    let index: Int
     @State private var animatedRatio: Double = 0
 
     private var targetRatio: Double {
@@ -296,7 +293,7 @@ private struct SubjectAverageCardView: View {
             }
         }
         .onAppear {
-            withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) {
+            withAnimation(.spring(response: 0.48, dampingFraction: 0.84).delay(Double(index) * 0.06)) {
                 animatedRatio = targetRatio
             }
         }

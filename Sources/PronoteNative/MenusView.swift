@@ -2,6 +2,9 @@ import SwiftUI
 
 struct MenusView: View {
     @ObservedObject var viewModel: AppViewModel
+    @State private var slideOffset: CGFloat = 0
+    @State private var slideOpacity: Double = 1
+    @State private var isAnimatingWeek: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,8 +27,8 @@ struct MenusView: View {
                     }
                     .padding(20)
                 }
-                .id(snapshot.days.first?.id)
-                .transition(.opacity)
+                .offset(x: slideOffset)
+                .opacity(slideOpacity)
             } else {
                 Spacer()
                 VStack(spacing: 10) {
@@ -39,19 +42,16 @@ struct MenusView: View {
                 Spacer()
             }
         }
+        .clipped()
         .background(AmbientBackground())
-        .animation(.easeInOut(duration: 0.22), value: viewModel.menus?.days.first?.id)
-        .navigationTitle("")
+        .navigationTitle("Cantine")
         .toolbar {
-            ToolbarItem(placement: .navigation) {
-                Text("Cantine")
-                    .font(.title3.bold())
-            }
-
             ToolbarItem(placement: .principal) {
                 HStack(spacing: 6) {
                     Button {
-                        Task { await viewModel.shiftMenusWeek(by: -7) }
+                        animateWeekShift(direction: -1) {
+                            await viewModel.shiftMenusWeek(by: -7)
+                        }
                     } label: {
                         Image(systemName: "chevron.left")
                     }
@@ -60,13 +60,38 @@ struct MenusView: View {
                         Task { await viewModel.loadMenus(forceRefresh: true) }
                     }
                     Button {
-                        Task { await viewModel.shiftMenusWeek(by: 7) }
+                        animateWeekShift(direction: 1) {
+                            await viewModel.shiftMenusWeek(by: 7)
+                        }
                     } label: {
                         Image(systemName: "chevron.right")
                     }
                 }
-                .disabled(viewModel.isLoading)
+                .disabled(viewModel.isLoading || isAnimatingWeek)
             }
+        }
+    }
+
+    private func animateWeekShift(direction: Int, action: @escaping @MainActor () async -> Void) {
+        guard !isAnimatingWeek else { return }
+        isAnimatingWeek = true
+        let exitX: CGFloat = direction > 0 ? -180 : 180
+        let enterX: CGFloat = direction > 0 ? 70 : -70
+
+        withAnimation(.easeIn(duration: 0.14)) {
+            slideOffset = exitX
+            slideOpacity = 0
+        }
+
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 140_000_000)
+            await action()
+            slideOffset = enterX
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+                slideOffset = 0
+                slideOpacity = 1
+            }
+            isAnimatingWeek = false
         }
     }
 }

@@ -2,4 +2,5 @@
 .DS_Store
 .swiftpm/
 *.app/
+AGENTS.md
 bridge/node_modules/

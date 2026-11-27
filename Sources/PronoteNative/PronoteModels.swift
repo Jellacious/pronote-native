@@ -1,4 +1,6 @@
+import CryptoKit
 import Foundation
+import IOKit
 import SwiftUI
 
 enum AppSection: String, CaseIterable, Identifiable, Sendable {
@@ -467,36 +469,147 @@ extension Color {
     }
 }
 
+enum SafeURL {
+    static func isPrivateOrLoopbackHost(_ rawHost: String) -> Bool {
+        var host = rawHost.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if host.hasPrefix("[") && host.hasSuffix("]") {
+            host = String(host.dropFirst().dropLast())
+        }
+        if host.isEmpty || host == "localhost" || host.hasSuffix(".local") || host == "0.0.0.0" || host == "::1" {
+            return true
+        }
+        let parts = host.split(separator: ".").compactMap { Int($0) }
+        if parts.count == 4 && parts.allSatisfy({ (0...255).contains($0) }) {
+            let (a, b) = (parts[0], parts[1])
+            if a == 127 || a == 10 || a == 0 { return true }
+            if a == 192 && b == 168 { return true }
+            if a == 169 && b == 254 { return true }
+            if a == 172 && (16...31).contains(b) { return true }
+        }
+        return false
+    }
+
+    static func validatedWebURL(_ raw: String, requireHTTPS: Bool = false) -> URL? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host,
+              !host.isEmpty else {
+            return nil
+        }
+        if requireHTTPS {
+            return scheme == "https" ? url : nil
+        }
+        return (scheme == "https" || scheme == "http") ? url : nil
+    }
+
+    static func validatedPronoteServerURL(_ raw: String) -> URL? {
+        guard let url = validatedWebURL(raw, requireHTTPS: true),
+              let host = url.host,
+              !isPrivateOrLoopbackHost(host) else {
+            return nil
+        }
+        return url
+    }
+
+    static func validatedGradebookURL(_ raw: String, expectedBaseURL: String) -> URL? {
+        guard let url = validatedWebURL(raw, requireHTTPS: true),
+              let host = url.host?.lowercased(),
+              let expectedHost = URL(string: expectedBaseURL)?.host?.lowercased(),
+              host == expectedHost else {
+            return nil
+        }
+        return url
+    }
+}
+
+private func secureAppSupportDir() -> URL {
+    let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+    let dir = appSupport.appendingPathComponent("PronoteNative", isDirectory: true)
+    try? FileManager.default.createDirectory(
+        at: dir,
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
+    )
+    try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+    return dir
+}
+
+private func writeSecureData(_ data: Data, to url: URL) {
+    do {
+        try data.write(to: url, options: [.atomic])
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    } catch {
+        // Ignore write errors
+    }
+}
+
+private func hardwareMachineUUID() -> String {
+    let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPlatformExpertDevice"))
+    guard service != 0 else { return "fallback-host-id" }
+    defer { IOObjectRelease(service) }
+    if let prop = IORegistryEntryCreateCFProperty(service, "IOPlatformUUID" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? String {
+        return prop
+    }
+    return "fallback-host-id"
+}
+
+private func credentialsSymmetricKey() -> SymmetricKey {
+    let ikmData = Data((hardwareMachineUUID() + ":" + NSUserName()).utf8)
+    return HKDF<SHA256>.deriveKey(
+        inputKeyMaterial: SymmetricKey(data: ikmData),
+        salt: Data("com.pronote.native.credentials.v1".utf8),
+        info: Data("aes-gcm-key".utf8),
+        outputByteCount: 32
+    )
+}
+
 enum CredentialsStore {
-    private static var fileURL: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = appSupport.appendingPathComponent("PronoteNative", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("credentials.json")
+    private static var encryptedFileURL: URL {
+        secureAppSupportDir().appendingPathComponent("credentials.enc")
+    }
+
+    private static var legacyFileURL: URL {
+        secureAppSupportDir().appendingPathComponent("credentials.json")
     }
 
     static func load() -> SavedCredentials? {
-        guard let data = try? Data(contentsOf: fileURL) else { return nil }
-        return try? JSONDecoder().decode(SavedCredentials.self, from: data)
+        if let encryptedData = try? Data(contentsOf: encryptedFileURL),
+           let box = try? AES.GCM.SealedBox(combined: encryptedData),
+           let decrypted = try? AES.GCM.open(box, using: credentialsSymmetricKey()),
+           let creds = try? JSONDecoder().decode(SavedCredentials.self, from: decrypted) {
+            try? FileManager.default.removeItem(at: legacyFileURL)
+            return creds
+        }
+
+        // Migration transparente depuis l'ancien fichier JSON en clair
+        if let legacyData = try? Data(contentsOf: legacyFileURL),
+           let migrated = try? JSONDecoder().decode(SavedCredentials.self, from: legacyData) {
+            save(migrated)
+            return migrated
+        }
+        return nil
     }
 
     static func save(_ credentials: SavedCredentials) {
-        if let data = try? JSONEncoder().encode(credentials) {
-            try? data.write(to: fileURL, options: [.atomic])
+        guard let jsonData = try? JSONEncoder().encode(credentials),
+              let sealed = try? AES.GCM.seal(jsonData, using: credentialsSymmetricKey()),
+              let combined = sealed.combined else {
+            return
         }
+        writeSecureData(combined, to: encryptedFileURL)
+        try? FileManager.default.removeItem(at: legacyFileURL)
     }
 
     static func clear() {
-        try? FileManager.default.removeItem(at: fileURL)
+        try? FileManager.default.removeItem(at: encryptedFileURL)
+        try? FileManager.default.removeItem(at: legacyFileURL)
     }
 }
 
 enum TimetableCacheStore {
     private static var fileURL: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = appSupport.appendingPathComponent("PronoteNative", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("timetable-cache.json")
+        secureAppSupportDir().appendingPathComponent("timetable-cache.json")
     }
 
     static func weekKey(for date: Date) -> String {
@@ -516,7 +629,7 @@ enum TimetableCacheStore {
 
     static func save(_ cache: [String: [CourseItem]]) {
         if let data = try? JSONEncoder().encode(cache) {
-            try? data.write(to: fileURL, options: [.atomic])
+            writeSecureData(data, to: fileURL)
         }
     }
 
@@ -527,10 +640,7 @@ enum TimetableCacheStore {
 
 enum SectionCacheStore {
     private static var fileURL: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = appSupport.appendingPathComponent("PronoteNative", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("section-cache.json")
+        secureAppSupportDir().appendingPathComponent("section-cache.json")
     }
 
     static func load() -> SectionCachePayload {
@@ -543,7 +653,7 @@ enum SectionCacheStore {
 
     static func save(_ payload: SectionCachePayload) {
         if let data = try? JSONEncoder().encode(payload) {
-            try? data.write(to: fileURL, options: [.atomic])
+            writeSecureData(data, to: fileURL)
         }
     }
 

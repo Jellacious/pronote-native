@@ -7,6 +7,6 @@
     "postinstall": "node patch-pawnote.mjs"
   },
   "dependencies": {
-    "pawnote": "^1.6.2"
+    "pawnote": "1.6.2"
   }
 }

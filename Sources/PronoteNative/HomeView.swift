@@ -2,14 +2,15 @@ import SwiftUI
 
 struct HomeView: View {
     @ObservedObject var viewModel: AppViewModel
+    @EnvironmentObject private var settings: AppSettings
+    @State private var recentlyCompletedIDs: Set<String> = []
 
     private var todayCourses: [CourseItem] {
-        let cal = Calendar(identifier: .iso8601)
-        return viewModel.courses.filter { cal.isDateInToday($0.startDate) }
+        viewModel.todayCourses
     }
 
     private var upcomingAssignments: [AssignmentItem] {
-        Array(viewModel.assignments.filter { !$0.done }.prefix(5))
+        Array(viewModel.assignments.filter { !$0.done || recentlyCompletedIDs.contains($0.id) }.prefix(5))
     }
 
     private var recentGrades: [GradeItem] {
@@ -72,6 +73,11 @@ struct HomeView: View {
                                 ForEach(upcomingAssignments) { item in
                                     HStack(alignment: .top, spacing: 8) {
                                         Button {
+                                            if item.done {
+                                                recentlyCompletedIDs.remove(item.id)
+                                            } else {
+                                                recentlyCompletedIDs.insert(item.id)
+                                            }
                                             Task { await viewModel.toggleAssignmentDone(item) }
                                         } label: {
                                             Image(systemName: item.done ? "checkmark.circle.fill" : "circle")
@@ -142,17 +148,45 @@ struct HomeView: View {
                     }
 
                     dashboardCard(title: "Menu de la cantine", icon: "fork.knife", section: .menus) {
-                        if let menu = todayMenu, !menu.lunch.isEmpty {
-                            VStack(alignment: .leading, spacing: 6) {
-                                ForEach(menu.lunch) { sec in
-                                    HStack(alignment: .top, spacing: 6) {
-                                        Text(sec.category)
-                                            .font(.caption2.weight(.semibold))
+                        if let menu = todayMenu,
+                           (!menu.lunch.isEmpty || (settings.showDinnerMenuOnHome && !menu.dinner.isEmpty)) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                if !menu.lunch.isEmpty {
+                                    if settings.showDinnerMenuOnHome && !menu.dinner.isEmpty {
+                                        Text("Midi")
+                                            .font(.caption.weight(.bold))
                                             .foregroundStyle(.secondary)
-                                            .frame(width: 96, alignment: .leading)
-                                        Text(sec.dishes.map { $0.name }.joined(separator: ", "))
-                                            .font(.caption)
-                                            .lineLimit(2)
+                                    }
+                                    ForEach(menu.lunch) { sec in
+                                        HStack(alignment: .top, spacing: 6) {
+                                            Text(sec.category)
+                                                .font(.caption2.weight(.semibold))
+                                                .foregroundStyle(.secondary)
+                                                .frame(width: 96, alignment: .leading)
+                                            Text(sec.dishes.map { $0.name }.joined(separator: ", "))
+                                                .font(.caption)
+                                                .lineLimit(2)
+                                        }
+                                    }
+                                }
+
+                                if settings.showDinnerMenuOnHome && !menu.dinner.isEmpty {
+                                    if !menu.lunch.isEmpty {
+                                        Divider()
+                                    }
+                                    Text("Soir")
+                                        .font(.caption.weight(.bold))
+                                        .foregroundStyle(.secondary)
+                                    ForEach(menu.dinner) { sec in
+                                        HStack(alignment: .top, spacing: 6) {
+                                            Text(sec.category)
+                                                .font(.caption2.weight(.semibold))
+                                                .foregroundStyle(.secondary)
+                                                .frame(width: 96, alignment: .leading)
+                                            Text(sec.dishes.map { $0.name }.joined(separator: ", "))
+                                                .font(.caption)
+                                                .lineLimit(2)
+                                        }
                                     }
                                 }
                             }
@@ -196,18 +230,8 @@ struct HomeView: View {
             .padding(20)
         }
         .background(AmbientBackground())
-        .navigationTitle("")
-        .toolbar {
-            ToolbarItem(placement: .navigation) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Accueil")
-                        .font(.title3.bold())
-                    Text(todayTitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-        }
+        .navigationTitle("Accueil")
+        .navigationSubtitle(todayTitle)
     }
 
     private var nowHeroCard: some View {

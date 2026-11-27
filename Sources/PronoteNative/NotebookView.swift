@@ -2,7 +2,7 @@ import SwiftUI
 
 struct NotebookView: View {
     @ObservedObject var viewModel: AppViewModel
-    @State private var showOnlyUnjustified: Bool = false
+    @AppStorage("notebookShowOnlyUnjustified") private var showOnlyUnjustified: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -90,13 +90,8 @@ struct NotebookView: View {
             }
         }
         .background(AmbientBackground())
-        .navigationTitle("")
+        .navigationTitle("Vie scolaire")
         .toolbar {
-            ToolbarItem(placement: .navigation) {
-                Text("Vie scolaire")
-                    .font(.title3.bold())
-            }
-
             ToolbarItem(placement: .principal) {
                 if let periods = viewModel.notebook?.periods, !periods.isEmpty {
                     Picker("Période", selection: Binding(

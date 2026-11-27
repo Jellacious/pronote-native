@@ -51,13 +51,8 @@ struct MessagesView: View {
             }
         }
         .background(AmbientBackground())
-        .navigationTitle("")
+        .navigationTitle("Messages & Infos")
         .toolbar {
-            ToolbarItem(placement: .navigation) {
-                Text("Messages & Infos")
-                    .font(.title3.bold())
-            }
-
             ToolbarItem(placement: .principal) {
                 Picker("Onglet", selection: $tab) {
                     Text("Discussions").tag(0)

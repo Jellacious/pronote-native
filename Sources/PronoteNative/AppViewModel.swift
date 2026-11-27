@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Network
 import SwiftUI
 
 @MainActor
@@ -28,13 +29,20 @@ final class AppViewModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var statusNotice: String?
     @Published var rateLimitUntil: Date?
+    @Published var isOffline: Bool = false
+    @Published var menuBarText: String?
+    @Published var nextAutoRefreshDate: Date?
 
     private let client = PronoteClient()
     private let settings: AppSettings?
+    private let networkMonitor = NWPathMonitor()
+    private let monitorQueue = DispatchQueue(label: "PronoteNative.NetworkMonitor")
     private var weekCache: [String: [CourseItem]]
     private var sectionCache: SectionCachePayload
     private var hasSyncedOnLaunch: Bool = false
     private var noticeTask: Task<Void, Never>?
+    private var menuBarTimerTask: Task<Void, Never>?
+    private var autoRefreshTask: Task<Void, Never>?
 
     private var cacheTTL: TimeInterval {
         settings?.cacheTTLSeconds ?? (10 * 60)
@@ -65,6 +73,235 @@ final class AppViewModel: ObservableObject {
         self.messages = loadedSections.messages
         self.menus = loadedSections.menus
         self.stickyNote = loadedSections.stickyNote ?? ""
+
+        networkMonitor.pathUpdateHandler = { [weak self] path in
+            let offline = (path.status != .satisfied)
+            Task { @MainActor [weak self] in
+                self?.isOffline = offline
+            }
+        }
+        networkMonitor.start(queue: monitorQueue)
+        refreshMenuBarText()
+        menuBarTimerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                guard !Task.isCancelled else { break }
+                self?.refreshMenuBarText()
+            }
+        }
+        startAutoRefreshLoop()
+    }
+
+    deinit {
+        networkMonitor.cancel()
+        menuBarTimerTask?.cancel()
+        autoRefreshTask?.cancel()
+    }
+
+    static func nextFixedRefreshSlot(after now: Date) -> Date {
+        let cal = Calendar.current
+        let startOfDay = cal.startOfDay(for: now)
+
+        var slots: [Date] = []
+        // 07:01 puis toutes les 15 min jusqu'à 19:46
+        var minuteOfDay = 7 * 60 + 1
+        while minuteOfDay <= 19 * 60 + 46 {
+            if let d = cal.date(byAdding: .minute, value: minuteOfDay, to: startOfDay) {
+                slots.append(d)
+            }
+            minuteOfDay += 15
+        }
+        // Dernier créneau garanti à 19:55
+        if let lastSlot = cal.date(byAdding: .minute, value: 19 * 60 + 55, to: startOfDay) {
+            slots.append(lastSlot)
+        }
+
+        if let nextToday = slots.first(where: { $0 > now }) {
+            return nextToday
+        }
+
+        let tomorrow = cal.date(byAdding: .day, value: 1, to: startOfDay) ?? startOfDay.addingTimeInterval(86_400)
+        return cal.date(byAdding: .minute, value: 7 * 60 + 1, to: tomorrow) ?? tomorrow
+    }
+
+    private func startAutoRefreshLoop() {
+        autoRefreshTask?.cancel()
+        autoRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let nextSlot = Self.nextFixedRefreshSlot(after: Date())
+                self?.nextAutoRefreshDate = nextSlot
+                let delay = max(1, nextSlot.timeIntervalSinceNow)
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                guard !Task.isCancelled else { break }
+                await self?.performScheduledRefresh(at: nextSlot)
+            }
+        }
+    }
+
+    private func performScheduledRefresh(at slot: Date) async {
+        guard credentials != nil,
+              settings?.autoRefreshEnabled == true,
+              !isOffline,
+              checkCooldown() else {
+            return
+        }
+
+        let cal = Calendar.current
+        let comps = cal.dateComponents([.hour, .minute, .weekday], from: slot)
+        let hour = comps.hour ?? 0
+        let minute = comps.minute ?? 0
+        let weekday = comps.weekday ?? 1
+
+        let isAnchorSlot = (hour == 7 && minute == 1) || (hour == 19 && minute == 55)
+        let minutesSinceStart = (hour * 60 + minute) - (7 * 60 + 1)
+        let isWeekday = (2...6).contains(weekday)
+
+        func shouldRun(intervalMinutes: Int, cacheKey: String, allowWeekend: Bool = true) -> Bool {
+            if !allowWeekend && !isWeekday { return false }
+            let interval = max(15, intervalMinutes)
+            let slotMatches = isAnchorSlot || (minutesSinceStart >= 0 && minutesSinceStart % interval == 0)
+            guard slotMatches else { return false }
+
+            // Si un refresh manuel vient d'être fait (< 5 min), on saute ce créneau auto
+            if let last = sectionCache.lastFetched?[cacheKey],
+               Date().timeIntervalSince(last) < 5 * 60 {
+                return false
+            }
+            return true
+        }
+
+        let ttInterval = settings?.refreshTimetableNotebookMinutes ?? 15
+        let gradesInterval = settings?.refreshGradesMinutes ?? 15
+        let hwInterval = settings?.refreshAssignmentsMinutes ?? 30
+        let msgInterval = settings?.refreshMessagesMinutes ?? 60
+
+        let ttKey = "timetable:\(TimetableCacheStore.weekKey(for: currentWeekStart))"
+        if shouldRun(intervalMinutes: ttInterval, cacheKey: ttKey) && !isOffline {
+            await loadTimetable(forceRefresh: true, bypassSmartCheck: true)
+        }
+        if shouldRun(intervalMinutes: ttInterval, cacheKey: "notebook") && !isOffline {
+            await loadNotebook(periodID: notebook?.selectedPeriodID, forceRefresh: true)
+        }
+        if shouldRun(intervalMinutes: gradesInterval, cacheKey: "grades") && !isOffline {
+            await loadGrades(periodID: grades?.selectedPeriodID, forceRefresh: true)
+        }
+        if shouldRun(intervalMinutes: hwInterval, cacheKey: "assignments") && !isOffline {
+            await loadAssignments(forceRefresh: true)
+        }
+        if shouldRun(intervalMinutes: msgInterval, cacheKey: "messages", allowWeekend: false) && !isOffline {
+            await loadMessages(forceRefresh: true)
+        }
+    }
+
+    var todayCourses: [CourseItem] {
+        let currentWeekKey = TimetableCacheStore.weekKey(for: Self.mondayOfWeek(for: Date()))
+        let source = weekCache[currentWeekKey] ?? courses
+        return source
+            .filter { Calendar.current.isDateInToday($0.startDate) }
+            .sorted { $0.startDate < $1.startDate }
+    }
+
+    func refreshMenuBarText() {
+        guard credentials != nil else {
+            menuBarText = nil
+            return
+        }
+        let now = Date()
+        let activeTodayCourses = todayCourses.filter { !$0.isCancelled }
+
+        let fmt = DateFormatter()
+        fmt.dateFormat = "HH:mm"
+        let showName = settings?.menuBarShowCourseName ?? false
+
+        let shortSubject: (String) -> String = { raw in
+            let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return t.count <= 16 ? t : String(t.prefix(15)) + "…"
+        }
+
+        if let current = activeTodayCourses.first(where: { $0.startDate <= now && $0.endDate > now }) {
+            if showName {
+                menuBarText = "\(shortSubject(current.subject)) · \(fmt.string(from: current.endDate))"
+            } else {
+                let rem = max(1, Int(ceil(current.endDate.timeIntervalSince(now) / 60)))
+                if rem >= 60 {
+                    menuBarText = "\(rem / 60)h\(String(format: "%02d", rem % 60))"
+                } else {
+                    menuBarText = "\(rem) min"
+                }
+            }
+            return
+        }
+
+        if let next = activeTodayCourses.first(where: { $0.startDate > now }) {
+            let minutes = max(1, Int(ceil(next.startDate.timeIntervalSince(now) / 60)))
+            if showName {
+                if minutes <= 60 {
+                    menuBarText = "Dans \(minutes) min · \(shortSubject(next.subject))"
+                } else {
+                    menuBarText = "\(shortSubject(next.subject)) · \(fmt.string(from: next.startDate))"
+                }
+            } else {
+                if minutes <= 60 {
+                    menuBarText = "Dans \(minutes) min"
+                } else {
+                    menuBarText = fmt.string(from: next.startDate)
+                }
+            }
+            return
+        }
+
+        menuBarText = nil
+    }
+
+    struct ScheduledDay: Identifiable {
+        let id: Date
+        let title: String
+        let isToday: Bool
+        let courses: [CourseItem]
+    }
+
+    func upcomingScheduledDays(from now: Date) -> [ScheduledDay] {
+        let cal = Calendar.current
+        let allCourses = weekCache.values
+            .flatMap { $0 }
+            .sorted { $0.startDate < $1.startDate }
+
+        let source = allCourses.isEmpty ? courses : allCourses
+        var result: [ScheduledDay] = []
+
+        let todayRemaining = source.filter { cal.isDateInToday($0.startDate) && $0.endDate > now }
+        if !todayRemaining.isEmpty {
+            result.append(
+                ScheduledDay(
+                    id: cal.startOfDay(for: now),
+                    title: "Aujourd'hui",
+                    isToday: true,
+                    courses: todayRemaining
+                )
+            )
+        }
+
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "fr_FR")
+        df.dateFormat = "EEEE d MMM"
+
+        let futureCourses = source.filter { !cal.isDateInToday($0.startDate) && $0.startDate > now }
+        let grouped = Dictionary(grouping: futureCourses) { cal.startOfDay(for: $0.startDate) }
+        for day in grouped.keys.sorted().prefix(10) {
+            let dayCourses = (grouped[day] ?? []).sorted { $0.startDate < $1.startDate }
+            guard !dayCourses.isEmpty else { continue }
+            let title = cal.isDateInTomorrow(day) ? "Demain" : df.string(from: day).capitalized
+            result.append(
+                ScheduledDay(
+                    id: day,
+                    title: title,
+                    isToday: false,
+                    courses: dayCourses
+                )
+            )
+        }
+
+        return result
     }
 
     var currentWeekLabel: String? {
@@ -152,14 +389,51 @@ final class AppViewModel: ObservableObject {
     private func handleNetworkError(_ error: Error) {
         let msg = error.localizedDescription
         let lower = msg.lowercased()
+        let isNetworkErr =
+            (error as? PronoteClientError).map {
+                if case .requestTimedOut = $0 { return true }
+                return false
+            } == true ||
+            lower.contains("réseau indisponible") ||
+            lower.contains("impossible de contacter") ||
+            lower.contains("enotfound") ||
+            lower.contains("econnrefused") ||
+            lower.contains("etimedout") ||
+            lower.contains("eai_again") ||
+            lower.contains("fetch failed") ||
+            lower.contains("offline") ||
+            lower.contains("hors-ligne")
+
         if lower.contains("rate-limit") || lower.contains("limite temporairement") || lower.contains("suspended") {
             let until = Date().addingTimeInterval(10 * 60)
             rateLimitUntil = until
             sectionCache.rateLimitUntil = until
             SectionCacheStore.save(sectionCache)
             errorMessage = "IP temporairement limitée par Pronote — pause de 10 min activée. Données affichées depuis le cache."
+        } else if isNetworkErr {
+            isOffline = true
+            if !hasCachedData(for: selectedSection) {
+                errorMessage = msg
+            }
         } else {
             errorMessage = msg
+        }
+    }
+
+    private func hasCachedData(for section: AppSection) -> Bool {
+        switch section {
+        case .home, .timetable:
+            return !courses.isEmpty
+        case .assignments:
+            return !assignments.isEmpty || !resources.isEmpty
+        case .grades:
+            return grades != nil
+        case .notebook:
+            return notebook != nil
+        case .messages:
+            return messages != nil
+        case .menus:
+            return menus != nil
         }
     }
 
@@ -237,6 +511,7 @@ final class AppViewModel: ObservableObject {
 
         if let cached = weekCache[key] {
             courses = cached
+            refreshMenuBarText()
             if !forceRefresh && isCacheFresh(for: cKey) {
                 errorMessage = nil
                 return
@@ -289,6 +564,7 @@ final class AppViewModel: ObservableObject {
             grouped[wkKey, default: []].append(course)
         }
 
+        let previousWeekCache = weekCache
         let now = Date()
         var fetchedMap = sectionCache.lastFetched ?? [:]
         for (wkKey, wkCourses) in grouped {
@@ -298,6 +574,8 @@ final class AppViewModel: ObservableObject {
         for (wkKey, lbl) in fetchedLabels {
             weekLabels[wkKey] = lbl
         }
+
+        notifyTimetableDiff(oldCache: previousWeekCache, newGrouped: grouped)
 
         sectionCache.weekLabels = weekLabels
         sectionCache.lastFetched = fetchedMap
@@ -309,6 +587,8 @@ final class AppViewModel: ObservableObject {
             courses = currentCourses
         }
 
+        isOffline = false
+        refreshMenuBarText()
         return updated
     }
 
@@ -323,9 +603,12 @@ final class AppViewModel: ObservableObject {
         errorMessage = nil
         do {
             let (updated, items) = try await client.fetchAssignments(credentials: saved)
+            isOffline = false
+            let previousAssignments = sectionCache.assignments
             assignments = items
             sectionCache.assignments = items
             markFetched("assignments")
+            notifyAssignmentsDiff(old: previousAssignments, new: items)
             credentials = updated
             CredentialsStore.save(updated)
         } catch {
@@ -345,6 +628,7 @@ final class AppViewModel: ObservableObject {
         errorMessage = nil
         do {
             let (updated, items) = try await client.fetchResources(credentials: saved)
+            isOffline = false
             resources = items
             sectionCache.resources = items
             markFetched("resources")
@@ -389,9 +673,12 @@ final class AppViewModel: ObservableObject {
         errorMessage = nil
         do {
             let (updated, snapshot) = try await client.fetchGrades(credentials: saved, periodID: periodID)
+            isOffline = false
+            let previousGrades = sectionCache.grades
             grades = snapshot
             sectionCache.grades = snapshot
             markFetched("grades")
+            notifyGradesDiff(old: previousGrades, new: snapshot)
             credentials = updated
             CredentialsStore.save(updated)
         } catch {
@@ -409,7 +696,11 @@ final class AppViewModel: ObservableObject {
         errorMessage = nil
         do {
             let url = try await client.fetchGradebookPDF(credentials: saved, periodID: grades?.selectedPeriodID)
-            NSWorkspace.shared.open(url)
+            guard let safeURL = SafeURL.validatedGradebookURL(url.absoluteString, expectedBaseURL: saved.baseURL) else {
+                errorMessage = "URL du bulletin PDF refusée par sécurité."
+                return
+            }
+            NSWorkspace.shared.open(safeURL)
         } catch {
             handleNetworkError(error)
         }
@@ -428,9 +719,12 @@ final class AppViewModel: ObservableObject {
         errorMessage = nil
         do {
             let (updated, snapshot) = try await client.fetchNotebook(credentials: saved, periodID: periodID)
+            isOffline = false
+            let previousNotebook = sectionCache.notebook
             notebook = snapshot
             sectionCache.notebook = snapshot
             markFetched("notebook")
+            notifyNotebookDiff(old: previousNotebook, new: snapshot)
             credentials = updated
             CredentialsStore.save(updated)
         } catch {
@@ -454,9 +748,12 @@ final class AppViewModel: ObservableObject {
         errorMessage = nil
         do {
             let (updated, snapshot) = try await client.fetchMessages(credentials: saved)
+            isOffline = false
+            let previousMessages = sectionCache.messages
             messages = snapshot
             sectionCache.messages = snapshot
             markFetched("messages")
+            notifyMessagesDiff(old: previousMessages, new: snapshot)
             credentials = updated
             CredentialsStore.save(updated)
         } catch {
@@ -525,6 +822,7 @@ final class AppViewModel: ObservableObject {
         errorMessage = nil
         do {
             let (updated, snapshot) = try await client.fetchMenus(credentials: saved, date: menusDate)
+            isOffline = false
             menus = snapshot
             sectionCache.menus = snapshot
             markFetched(key)
@@ -593,6 +891,7 @@ final class AppViewModel: ObservableObject {
         stickyNote = ""
         selectedDiscussionMessages = []
         errorMessage = nil
+        refreshMenuBarText()
         Task {
             await client.logout()
         }
@@ -602,5 +901,225 @@ final class AppViewModel: ObservableObject {
         let cal = Calendar(identifier: .iso8601)
         let components = cal.dateComponents([.yearForWeekOfYear, .weekOfYear], from: date)
         return cal.date(from: components) ?? date
+    }
+
+    // MARK: - Notifications différentielles
+
+    private func notifyTimetableDiff(oldCache: [String: [CourseItem]], newGrouped: [String: [CourseItem]]) {
+        guard settings?.notificationsEnabled == true,
+              settings?.notifyTimetableChanges == true else { return }
+
+        let cal = Calendar.current
+        let startOfToday = cal.startOfDay(for: Date())
+        let horizon = cal.date(byAdding: .day, value: 14, to: startOfToday) ?? startOfToday
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "fr_FR")
+        df.dateFormat = "EEE d MMM"
+
+        var changes: [String] = []
+        let stableKey: (CourseItem) -> String = { course in
+            let startMin = Int(course.startDate.timeIntervalSince1970 / 60)
+            let endMin = Int(course.endDate.timeIntervalSince1970 / 60)
+            let subj = course.subject.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return "\(startMin)-\(endMin)-\(subj)"
+        }
+
+        for (wkKey, newCourses) in newGrouped {
+            guard let oldCourses = oldCache[wkKey], !oldCourses.isEmpty else { continue }
+            let relevantOld = oldCourses.filter { $0.startDate >= startOfToday && $0.startDate <= horizon }
+            let relevantNew = newCourses.filter { $0.startDate >= startOfToday && $0.startDate <= horizon }
+            guard !relevantOld.isEmpty else { continue }
+
+            let oldByKey = Dictionary(relevantOld.map { (stableKey($0), $0) }, uniquingKeysWith: { first, _ in first })
+            let newByKey = Dictionary(relevantNew.map { (stableKey($0), $0) }, uniquingKeysWith: { first, _ in first })
+
+            for course in relevantNew {
+                let k = stableKey(course)
+                let dayStr = df.string(from: course.startDate)
+                if let old = oldByKey[k] {
+                    if !old.isCancelled && course.isCancelled {
+                        changes.append("Cours annulé (\(dayStr)) : \(course.subject) (\(course.timeRangeString))")
+                    } else if (old.room ?? "") != (course.room ?? ""), let newRoom = course.room, !newRoom.isEmpty {
+                        changes.append("Salle modifiée (\(dayStr)) : \(course.subject) → Salle \(newRoom)")
+                    }
+                } else if !course.isCancelled {
+                    changes.append("Cours ajouté (\(dayStr)) : \(course.subject) (\(course.timeRangeString))")
+                }
+            }
+
+            for old in relevantOld where newByKey[stableKey(old)] == nil && !old.isCancelled {
+                let dayStr = df.string(from: old.startDate)
+                changes.append("Cours supprimé (\(dayStr)) : \(old.subject) (\(old.timeRangeString))")
+            }
+        }
+
+        guard !changes.isEmpty else { return }
+        if changes.count == 1 {
+            NotificationManager.shared.send(
+                title: "Emploi du temps modifié",
+                body: changes[0],
+                section: .timetable
+            )
+        } else {
+            let preview = changes.prefix(2).joined(separator: "\n")
+            NotificationManager.shared.send(
+                title: "\(changes.count) changements d'emploi du temps",
+                body: preview,
+                section: .timetable
+            )
+        }
+    }
+
+    private func notifyGradesDiff(old: GradesSnapshot?, new: GradesSnapshot) {
+        guard settings?.notificationsEnabled == true,
+              settings?.notifyNewGrades == true,
+              let old,
+              old.selectedPeriodID == new.selectedPeriodID else { return }
+
+        let gradeKey: (GradeItem) -> String = { g in
+            "\(g.subject.lowercased())-\(Int(g.date.timeIntervalSince1970 / 86_400))-\(g.valueDisplay)-\(g.outOfDisplay)-\(g.comment ?? "")"
+        }
+        let oldKeys = Set(old.grades.map(gradeKey))
+        let added = new.grades.filter { !oldKeys.contains(gradeKey($0)) }
+        guard !added.isEmpty else { return }
+
+        let hideValue = settings?.notifyHideGradeValue == true
+        if added.count <= 2 {
+            for g in added {
+                let body = hideValue
+                    ? "Nouvelle note publiée en \(g.subject)"
+                    : "\(g.subject) : \(g.valueDisplay)/\(g.outOfDisplay)"
+                NotificationManager.shared.send(
+                    title: "Nouvelle note",
+                    body: body,
+                    section: .grades,
+                    identifier: "grade-\(g.id)"
+                )
+            }
+        } else {
+            let subjects = Array(Set(added.map(\.subject))).prefix(3).joined(separator: ", ")
+            NotificationManager.shared.send(
+                title: "\(added.count) nouvelles notes",
+                body: subjects,
+                section: .grades
+            )
+        }
+    }
+
+    private func notifyAssignmentsDiff(old: [AssignmentItem]?, new: [AssignmentItem]) {
+        guard settings?.notificationsEnabled == true,
+              settings?.notifyNewAssignments == true,
+              let old else { return }
+
+        let startOfToday = Calendar.current.startOfDay(for: Date())
+        let hwKey: (AssignmentItem) -> String = { hw in
+            "\(Int(hw.deadline.timeIntervalSince1970 / 86_400))-\(hw.subject.lowercased())-\(hw.description.prefix(40).lowercased())"
+        }
+        let oldKeys = Set(old.map(hwKey))
+        let added = new.filter { !oldKeys.contains(hwKey($0)) && $0.deadline >= startOfToday }
+        guard !added.isEmpty else { return }
+
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "fr_FR")
+        df.dateFormat = "EEE d MMM"
+
+        if added.count <= 2 {
+            for hw in added {
+                let desc = hw.description.isEmpty ? "Nouveau travail à faire" : hw.description
+                NotificationManager.shared.send(
+                    title: "Nouveau devoir · \(hw.subject)",
+                    body: "Pour le \(df.string(from: hw.deadline)) : \(desc)",
+                    section: .assignments,
+                    identifier: "hw-\(hw.id)"
+                )
+            }
+        } else {
+            NotificationManager.shared.send(
+                title: "\(added.count) nouveaux devoirs",
+                body: Array(Set(added.map(\.subject))).prefix(3).joined(separator: ", "),
+                section: .assignments
+            )
+        }
+    }
+
+    private func notifyMessagesDiff(old: MessagesSnapshot?, new: MessagesSnapshot) {
+        guard settings?.notificationsEnabled == true,
+              settings?.notifyNewMessages == true,
+              let old else { return }
+
+        let oldDiscMap = Dictionary(old.discussions.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let oldNewsIDs = Set(old.news.map(\.id))
+
+        var alerts: [(String, String, String)] = []
+        for disc in new.discussions where disc.unreadCount > 0 {
+            let prevUnread = oldDiscMap[disc.id]?.unreadCount ?? 0
+            if disc.unreadCount > prevUnread || oldDiscMap[disc.id] == nil {
+                alerts.append(("Nouveau message · \(disc.creator)", disc.subject, "disc-\(disc.id)-\(disc.unreadCount)"))
+            }
+        }
+        for item in new.news where !item.read && !oldNewsIDs.contains(item.id) {
+            alerts.append(("Nouvelle info · \(item.author)", item.title, "news-\(item.id)"))
+        }
+
+        guard !alerts.isEmpty else { return }
+        if alerts.count <= 2 {
+            for (title, body, id) in alerts {
+                NotificationManager.shared.send(title: title, body: body, section: .messages, identifier: id)
+            }
+        } else {
+            NotificationManager.shared.send(
+                title: "\(alerts.count) nouveaux messages / infos",
+                body: alerts.prefix(2).map(\.1).joined(separator: " · "),
+                section: .messages
+            )
+        }
+    }
+
+    private func notifyNotebookDiff(old: NotebookSnapshot?, new: NotebookSnapshot) {
+        guard settings?.notificationsEnabled == true,
+              settings?.notifyNewAbsences == true,
+              let old,
+              old.selectedPeriodID == new.selectedPeriodID else { return }
+
+        let absKey: (AbsenceItem) -> String = { a in
+            "\(Int(a.startDate.timeIntervalSince1970 / 60))-\(Int(a.endDate.timeIntervalSince1970 / 60))"
+        }
+        let delayKey: (DelayItem) -> String = { d in
+            "\(Int(d.date.timeIntervalSince1970 / 60))-\(d.minutes)"
+        }
+        let oldAbsKeys = Set(old.absences.map(absKey))
+        let newAbs = new.absences.filter { !oldAbsKeys.contains(absKey($0)) }
+        let oldDelayKeys = Set(old.delays.map(delayKey))
+        let newDelays = new.delays.filter { !oldDelayKeys.contains(delayKey($0)) }
+
+        if newAbs.count == 1, let abs = newAbs.first {
+            NotificationManager.shared.send(
+                title: "Nouvelle absence",
+                body: abs.justified ? "Absence justifiée enregistrée" : "Absence non justifiée enregistrée",
+                section: .notebook,
+                identifier: "abs-\(abs.id)"
+            )
+        } else if newAbs.count > 1 {
+            NotificationManager.shared.send(
+                title: "\(newAbs.count) nouvelles absences",
+                body: "Consulte la rubrique Vie scolaire.",
+                section: .notebook
+            )
+        }
+
+        if newDelays.count == 1, let delay = newDelays.first {
+            NotificationManager.shared.send(
+                title: "Nouveau retard",
+                body: "Retard de \(delay.minutes) min enregistré",
+                section: .notebook,
+                identifier: "delay-\(delay.id)"
+            )
+        } else if newDelays.count > 1 {
+            NotificationManager.shared.send(
+                title: "\(newDelays.count) nouveaux retards",
+                body: "Consulte la rubrique Vie scolaire.",
+                section: .notebook
+            )
+        }
     }
 }

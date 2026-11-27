@@ -4,7 +4,7 @@ import SwiftUI
 struct AssignmentsView: View {
     @ObservedObject var viewModel: AppViewModel
     @State private var tab: Int = 0 // 0 = Travail à faire, 1 = Contenus de cours
-    @State private var showOnlyUndone: Bool = false
+    @AppStorage("assignmentsShowOnlyUndone") private var showOnlyUndone: Bool = false
     @State private var selectedSubject: String = "Toutes"
 
     private var subjectsList: [String] {
@@ -62,7 +62,7 @@ struct AssignmentsView: View {
         .background(AmbientBackground())
         .animation(.easeInOut(duration: 0.2), value: showOnlyUndone)
         .animation(.easeInOut(duration: 0.2), value: selectedSubject)
-        .navigationTitle("")
+        .navigationTitle("Cahier de textes")
         .onChange(of: tab) { _, newTab in
             selectedSubject = "Toutes"
             if newTab == 1 {
@@ -70,11 +70,6 @@ struct AssignmentsView: View {
             }
         }
         .toolbar {
-            ToolbarItem(placement: .navigation) {
-                Text("Cahier de textes")
-                    .font(.title3.bold())
-            }
-
             ToolbarItem(placement: .principal) {
                 Picker("Onglet", selection: $tab) {
                     Text("Travail à faire").tag(0)
@@ -117,7 +112,6 @@ struct AssignmentsView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 8)
-        .background(.ultraThinMaterial)
     }
 
     @ViewBuilder
@@ -262,7 +256,7 @@ struct AttachmentPillView: View {
 
     var body: some View {
         Button {
-            if let url = URL(string: attachment.url) {
+            if let url = SafeURL.validatedWebURL(attachment.url) {
                 NSWorkspace.shared.open(url)
             }
         } label: {

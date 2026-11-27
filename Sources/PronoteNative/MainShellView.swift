@@ -28,7 +28,7 @@ struct MainShellView: View {
                 .tag(section)
             }
             .listStyle(.sidebar)
-            .navigationSplitViewColumnWidth(min: 195, ideal: 215, max: 250)
+            .navigationSplitViewColumnWidth(min: 215, ideal: 230, max: 270)
             .safeAreaInset(edge: .bottom) {
                 VStack(alignment: .leading, spacing: 4) {
                     Divider()
@@ -86,7 +86,6 @@ struct MainShellView: View {
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
                 }
-                .background(.ultraThinMaterial)
             }
         } detail: {
             Group {
@@ -107,9 +106,13 @@ struct MainShellView: View {
                     MenusView(viewModel: viewModel)
                 }
             }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if viewModel.isOffline {
+                    offlineBanner
+                }
+            }
         }
         .onChange(of: viewModel.selectedSection) { _, newSection in
-            Haptics.play(.generic)
             Task {
                 await viewModel.loadSection(newSection)
             }
@@ -159,6 +162,13 @@ struct MainShellView: View {
                         .font(.caption2.weight(.medium))
                         .foregroundStyle(.orange)
                 }
+            } else if viewModel.isOffline {
+                HStack(spacing: 6) {
+                    Circle().fill(Color.orange).frame(width: 6, height: 6)
+                    Text("Hors-ligne (cache)")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.orange)
+                }
             } else if let updated = viewModel.lastUpdatedDate(for: viewModel.selectedSection) {
                 let elapsed = max(0, Int(now.timeIntervalSince(updated) / 60))
                 HStack(spacing: 6) {
@@ -169,6 +179,42 @@ struct MainShellView: View {
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private var offlineBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "wifi.slash")
+                .foregroundStyle(.orange)
+            Text(offlineBannerText)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.primary)
+            Spacer()
+            Button("Réessayer") {
+                Task {
+                    await viewModel.loadSection(viewModel.selectedSection, forceRefresh: true)
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(viewModel.isLoading)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.12))
+        .overlay(alignment: .bottom) {
+            Divider()
+        }
+    }
+
+    private var offlineBannerText: String {
+        if let updated = viewModel.lastUpdatedDate(for: viewModel.selectedSection) {
+            let df = DateFormatter()
+            df.locale = Locale(identifier: "fr_FR")
+            df.dateFormat = "d MMM à HH:mm"
+            return "Mode hors-ligne — données en cache du \(df.string(from: updated))"
+        }
+        return "Mode hors-ligne — aucune donnée en cache pour cette section"
     }
 
     private func badgeCount(for section: AppSection) -> Int? {

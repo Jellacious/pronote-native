@@ -50,7 +50,7 @@ struct LoginView: View {
                                 .foregroundStyle(.green)
                             Text("QR Code détecté !")
                                 .font(.headline)
-                            Text(payload.url)
+                            Text(URL(string: payload.url)?.host ?? payload.url)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
@@ -147,8 +147,13 @@ struct LoginView: View {
 
     private func submit() {
         guard let qrPayload, pin.count == 4 else { return }
+        let enteredPin = pin
         Task {
-            await viewModel.loginWithQRCode(payload: qrPayload, pin: pin)
+            await viewModel.loginWithQRCode(payload: qrPayload, pin: enteredPin)
+            if viewModel.credentials != nil {
+                pin = ""
+                self.qrPayload = nil
+            }
         }
     }
 

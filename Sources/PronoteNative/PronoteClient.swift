@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 enum PronoteClientError: LocalizedError {
@@ -6,6 +7,7 @@ enum PronoteClientError: LocalizedError {
     case processFailed(String)
     case authenticationFailed(String)
     case invalidResponse
+    case requestTimedOut
 
     var errorDescription: String? {
         switch self {
@@ -19,7 +21,26 @@ enum PronoteClientError: LocalizedError {
             return msg
         case .invalidResponse:
             return "Réponse invalide du bridge Pawnote."
+        case .requestTimedOut:
+            return "Délai d'attente dépassé : le serveur Pronote ne répond pas."
         }
+    }
+}
+
+private final class TimeoutFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var triggered = false
+
+    func trigger() {
+        lock.lock()
+        triggered = true
+        lock.unlock()
+    }
+
+    var isTriggered: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return triggered
     }
 }
 
@@ -592,6 +613,7 @@ actor PronoteClient {
             return
         }
         _ = try? await sendRequest(BridgeLogoutRequest())
+        resetWorker()
     }
 
     private func parseISO(_ value: String) -> Date? {
@@ -605,13 +627,14 @@ actor PronoteClient {
         return standard.date(from: value)
     }
 
-    private func ensureWorkerRunning() throws -> (FileHandle, FileHandle) {
+    private func ensureWorkerRunning() throws -> (Process, FileHandle, FileHandle) {
         if let process = workerProcess, process.isRunning,
            let stdinHandle, let stdoutHandle {
-            return (stdinHandle, stdoutHandle)
+            return (process, stdinHandle, stdoutHandle)
         }
 
         resetWorker()
+        signal(SIGPIPE, SIG_IGN)
 
         let nodeURL = try resolveNodeExecutable()
         let scriptURL = try resolveBridgeScript()
@@ -620,6 +643,16 @@ actor PronoteClient {
         process.executableURL = nodeURL
         process.arguments = [scriptURL.path]
         process.currentDirectoryURL = scriptURL.deletingLastPathComponent()
+
+        let allowedKeys = ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"]
+        var cleanEnv: [String: String] = [:]
+        let currentEnv = ProcessInfo.processInfo.environment
+        for key in allowedKeys {
+            if let value = currentEnv[key] {
+                cleanEnv[key] = value
+            }
+        }
+        process.environment = cleanEnv
 
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
@@ -634,7 +667,7 @@ actor PronoteClient {
         self.stdoutHandle = stdoutPipe.fileHandleForReading
         self.stdoutBuffer = Data()
 
-        return (stdinPipe.fileHandleForWriting, stdoutPipe.fileHandleForReading)
+        return (process, stdinPipe.fileHandleForWriting, stdoutPipe.fileHandleForReading)
     }
 
     private func resetWorker() {
@@ -648,26 +681,52 @@ actor PronoteClient {
     }
 
     private func sendRequest<T: Encodable>(_ payload: T) async throws -> BridgeResponse {
-        let (stdin, stdout) = try ensureWorkerRunning()
+        let (process, stdin, stdout) = try ensureWorkerRunning()
         var lineData = try JSONEncoder().encode(payload)
         lineData.append(0x0A)
 
         let payloadData = lineData
         let existingBuffer = self.stdoutBuffer
-        let (lineResult, remainingBuffer): (Data?, Data) = await withCheckedContinuation { continuation in
+        let maxBufferBytes = 16 * 1024 * 1024
+        let timeoutFlag = TimeoutFlag()
+
+        let timeoutTask = Task.detached {
+            try? await Task.sleep(nanoseconds: 30_000_000_000)
+            if !Task.isCancelled {
+                timeoutFlag.trigger()
+                if process.isRunning {
+                    process.terminate()
+                }
+            }
+        }
+
+        let (lineResult, remainingBuffer, writeFailed): (Data?, Data, Bool) = await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                stdin.write(payloadData)
+                do {
+                    try stdin.write(contentsOf: payloadData)
+                } catch {
+                    continuation.resume(returning: (nil, Data(), true))
+                    return
+                }
+
                 var buffer = existingBuffer
                 while true {
                     if let newlineIndex = buffer.firstIndex(of: 0x0A) {
                         let line = buffer.subdata(in: 0..<newlineIndex)
                         let rest = buffer.subdata(in: (newlineIndex + 1)..<buffer.count)
-                        continuation.resume(returning: (line, rest))
+                        continuation.resume(returning: (line, rest, false))
+                        return
+                    }
+                    if buffer.count > maxBufferBytes {
+                        if process.isRunning {
+                            process.terminate()
+                        }
+                        continuation.resume(returning: (nil, Data(), false))
                         return
                     }
                     let chunk = stdout.availableData
                     if chunk.isEmpty {
-                        continuation.resume(returning: (nil, Data()))
+                        continuation.resume(returning: (nil, Data(), false))
                         return
                     }
                     buffer.append(chunk)
@@ -675,7 +734,18 @@ actor PronoteClient {
             }
         }
 
+        timeoutTask.cancel()
         self.stdoutBuffer = remainingBuffer
+
+        if timeoutFlag.isTriggered {
+            resetWorker()
+            throw PronoteClientError.requestTimedOut
+        }
+
+        if writeFailed {
+            resetWorker()
+            throw PronoteClientError.processFailed("Impossible d'écrire vers le worker Pawnote.")
+        }
 
         guard let lineResult else {
             resetWorker()
@@ -695,11 +765,13 @@ actor PronoteClient {
             return bundled
         }
 
+        #if DEBUG
         let devFallback = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Codes/pronote-native/bridge/bridge.mjs")
         if FileManager.default.fileExists(atPath: devFallback.path) {
             return devFallback
         }
+        #endif
 
         throw PronoteClientError.bridgeNotFound
     }
@@ -708,11 +780,8 @@ actor PronoteClient {
         let fm = FileManager.default
         var candidates: [String] = []
 
-        let nvmDir = fm.homeDirectoryForCurrentUser.appendingPathComponent(".nvm/versions/node")
-        if let versions = try? fm.contentsOfDirectory(atPath: nvmDir.path) {
-            for version in versions.sorted().reversed() {
-                candidates.append(nvmDir.appendingPathComponent(version).appendingPathComponent("bin/node").path)
-            }
+        if let bundledNode = Bundle.main.resourceURL?.appendingPathComponent("node") {
+            candidates.append(bundledNode.path)
         }
 
         candidates.append(contentsOf: [
@@ -721,10 +790,32 @@ actor PronoteClient {
             "/usr/bin/node"
         ])
 
+        let nvmDir = fm.homeDirectoryForCurrentUser.appendingPathComponent(".nvm/versions/node")
+        if let versions = try? fm.contentsOfDirectory(atPath: nvmDir.path) {
+            let validSorted = versions
+                .filter { $0.hasPrefix("v") && $0.dropFirst().first?.isNumber == true }
+                .sorted { parseSemver($0) > parseSemver($1) }
+            for version in validSorted {
+                candidates.append(nvmDir.appendingPathComponent(version).appendingPathComponent("bin/node").path)
+            }
+        }
+
         for path in candidates where fm.isExecutableFile(atPath: path) {
             return URL(fileURLWithPath: path)
         }
 
         throw PronoteClientError.nodeNotFound
+    }
+
+    private func parseSemver(_ version: String) -> (Int, Int, Int) {
+        let parts = version
+            .trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
+            .split(separator: ".")
+            .compactMap { Int($0) }
+        return (
+            parts.count > 0 ? parts[0] : 0,
+            parts.count > 1 ? parts[1] : 0,
+            parts.count > 2 ? parts[2] : 0
+        )
     }
 }
